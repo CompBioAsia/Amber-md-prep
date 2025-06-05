@@ -1,0 +1,22 @@
+name: cba_md_25
+channels:
+    - conda-forge
+dependencies:
+    - pip
+    - python=3.10
+    - jupyterlab>=4
+    - ipywidgets>=8
+    # Cookbook
+    - gitpython
+    - nbconvert
+    - nbformat
+    - requests
+    - packaging
+    # Examples
+    - rich
+    - jax
+    - parmed<4
+    - nglview>=3.0.6,<3.1.0
+    - netCDF4
+    - openbabel
+    - pdbfixer
