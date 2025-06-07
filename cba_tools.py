@@ -181,6 +181,8 @@ def parameterize(source, residue_name, charge=0, gaff='gaff'):
     traj_hets = traj.atom_slice(het_sel)
     # A trajetory that contains a single copy of the selected heterogen:
     traj_het = traj_hets.atom_slice(traj_hets.topology.select('resid 0'))
+    # Remove bonds as they cause problems
+    traj_het.topology._bonds = []
     # Run antechamber
     traj_het.save(f'{residue_name}.pdb')
     check_available('antechamber')
