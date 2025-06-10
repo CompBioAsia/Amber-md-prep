@@ -2,10 +2,39 @@ import mdtraj as mdt
 from pdbfixer import PDBFixer
 from openmm.app import PDBFile
 
+from rdkit import Chem
+from rdkit.Chem import rdDistGeom
+from openbabel import openbabel as ob
+
 from crossflow.kernels import SubprocessKernel
 from crossflow.filehandling import FileHandler
 from functools import cache
 import shutil
+
+
+def smiles_to_pdb(smi, pdb, pH=7.0):
+    '''
+    Convert an input SMILES representation to a PDB file
+
+    Args:
+        smi (str): Input SMILES string
+        pdb (str): Name out output PDB file
+        pH (float): target pH
+
+    '''
+    obc = ob.OBConversion()
+    obc.SetInAndOutFormats('smi', 'smi')
+ 
+    obmol = ob.OBMol()
+    obc.ReadString(obmol, smi)
+    obmol.CorrectForPH(pH)
+    smi_pH = obc.WriteString(obmol)
+    charge = smi_pH.count('+') - smi_pH.count('-')
+    mol_pH = Chem.MolFromSmiles(smi_pH)
+    mol_pH_H = Chem.AddHs(mol_pH)
+    rdDistGeom.EmbedMolecule(mol_pH_H)
+    Chem.MolToPDBFile(mol_pH_H, pdb)
+    return charge
 
 
 def fix(inpdb, outpdb, keep_chains=None, trim=True):
@@ -73,19 +102,31 @@ def check_available(cmd):
 
 def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
     '''
-    Add hydrogen atoms to a PDB format file, using Chimera
+    Add hydrogen atoms to a PDB format file, using Chimera or ChimeraX
 
     Args:
         inpdb (str): name of input PDB file
         outpdb (str): name of output PDB file
-        chimera (str): command to invoke Chimera
+        chimera (str): command to invoke Chimera/ChimeraX
         mode (str): Adjust residue names for chosen software
                     (only 'amber' is currently supported).
     '''
+    #
     check_available(chimera)
+    chimera_version = SubprocessTask(f"{chimera} --version > version")
+    chimera_version.set_outputs(["version"])
+    version = chimera_version.run()
+    if 'ChimeraX' in version.read_text():
+        chimera_type = 'chimerax'
+    else:
+        chimera_type = 'chimera'
+
     fh = FileHandler()
     script = fh.create('script')
-    script.write_text('open infile.pdb\naddh\nwrite 0  outfile.pdb\nstop')
+    if chimera_type == 'chimerax':
+        script.write_text('open infile.pdb\naddh\nsave outfile.pdb #1\nquit')
+    else:
+        script.write_text('open infile.pdb\naddh\nwrite 0  outfile.pdb\nstop')
     addh = SubprocessKernel(f"{chimera} --nogui < script")
     addh.set_inputs(['script', 'infile.pdb'])
     addh.set_outputs(['outfile.pdb'])
@@ -122,8 +163,8 @@ def param(inpdb, outprmtop, outinpcrd, het_names=None, het_charges=None,
     """
     if not forcefields:
         print('Warning: no forcefields specified, '
-              'defaulting to "protein.ff19SB"')
-        forcefields = ['protein.ff19SB']
+              'defaulting to "protein.ff14SB"')
+        forcefields = ['protein.ff14SB']
     if solvate:
         if solvate not in ['oct', 'box', 'cube']:
             raise ValueError(f'Error: unrecognised solvate option "{solvate}"')
