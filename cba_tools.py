@@ -6,7 +6,7 @@ from rdkit import Chem
 from rdkit.Chem import rdDistGeom
 from openbabel import openbabel as ob
 
-from crossflow.kernels import SubprocessKernel
+from crossflow.tasks import SubprocessTask
 from crossflow.filehandling import FileHandler
 from functools import cache
 import shutil
@@ -127,7 +127,7 @@ def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
         script.write_text('open infile.pdb\naddh\nsave outfile.pdb #1\nquit')
     else:
         script.write_text('open infile.pdb\naddh\nwrite 0  outfile.pdb\nstop')
-    addh = SubprocessKernel(f"{chimera} --nogui < script")
+    addh = SubprocessTask(f"{chimera} --nogui < script")
     addh.set_inputs(['script', 'infile.pdb'])
     addh.set_outputs(['outfile.pdb'])
     addh.set_constant('script', script)
@@ -135,7 +135,7 @@ def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
     outfile = addh.run(infile)
     if mode == 'amber':
         check_available('pdb4amber')
-        pdb4amber = SubprocessKernel('pdb4amber -i infile.pdb -o outfile.pdb')
+        pdb4amber = SubprocessTask('pdb4amber -i infile.pdb -o outfile.pdb')
         pdb4amber.set_inputs(['infile.pdb'])
         pdb4amber.set_outputs(['outfile.pdb'])
         amberpdb = pdb4amber.run(outfile)
@@ -228,11 +228,11 @@ def parameterize(source, residue_name, charge=0, gaff='gaff'):
     traj_het.save(f'{residue_name}.pdb')
     check_available('antechamber')
     if gaff == 'gaff':
-        antechamber = SubprocessKernel('antechamber -i infile.pdb -fi pdb'
+        antechamber = SubprocessTask('antechamber -i infile.pdb -fi pdb'
                                        ' -o outfile.mol2 -fo mol2 -c bcc'
                                        ' -nc {charge}')
     else:
-        antechamber = SubprocessKernel('antechamber -i infile.pdb -fi pdb'
+        antechamber = SubprocessTask('antechamber -i infile.pdb -fi pdb'
                                        ' -o outfile.mol2 -fo mol2 -c bcc'
                                        ' -nc {charge} -at gaff2')
     antechamber.set_inputs(['infile.pdb', 'charge'])
@@ -241,10 +241,10 @@ def parameterize(source, residue_name, charge=0, gaff='gaff'):
     # run parmchk2
     check_available('parmchk2')
     if gaff == 'gaff':
-        parmchk = SubprocessKernel('parmchk2 -i infile.mol2 -f mol2 -o'
+        parmchk = SubprocessTask('parmchk2 -i infile.mol2 -f mol2 -o'
                                    ' outfile.frcmod')
     else:
-        parmchk = SubprocessKernel('parmchk2 -s 2 -i infile.mol2 -f mol2'
+        parmchk = SubprocessTask('parmchk2 -s 2 -i infile.mol2 -f mol2'
                                    ' -o outfile.frcmod')
     parmchk.set_inputs(['infile.mol2'])
     parmchk.set_outputs(['outfile.frcmod'])
@@ -290,7 +290,7 @@ def leap(amberpdb, ff, het_names=None, solvate=None, buffer=10.0):
         script += "addions system Na+ 0\naddions system Cl- 0\n"
     script += "saveamberparm system system.prmtop system.inpcrd\nquit"
 
-    tleap = SubprocessKernel('tleap -f script')
+    tleap = SubprocessTask('tleap -f script')
     tleap.set_inputs(inputs)
     tleap.set_outputs(outputs)
     fh = FileHandler()
