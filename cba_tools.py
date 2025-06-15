@@ -11,6 +11,7 @@
 #   PDBFixer (a'spin-off' from OpenMM)
 #   Chimera/ChimeraX
 #   AmberTools
+#   MDTraj
 #
 # The functions are:
 #
@@ -220,6 +221,17 @@ def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
         amberpdb.save(outpdb)
     else:
         outfile.save(outpdb)
+    t_orig = mdt.load_pdb(inpdb, standard_names=False)
+    t_hydrated = mdt.load_pdb(outpdb, standard_names=False)
+    n_h_orig = len(t_orig.topology.select('mass < 2.0'))
+    n_h_hydrated = len(t_hydrated.topology.select('mass < 2.0'))
+    n_h_added = n_h_hydrated - n_h_orig
+    print(f'fix added {n_h_added} hydrogen atoms')
+    if mode == 'amber':
+        for i, r in enumerate(t_orig.topology.residues):
+            r_new = t_hydrated.topology.residue(i)
+            if r.name != r_new.name:
+                print(f'{r.name}{r.resSeq} is now {r_new.name}')
     print(f'Hydrated structure written to {outpdb}')
 
 
