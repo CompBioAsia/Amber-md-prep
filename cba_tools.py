@@ -1,3 +1,66 @@
+# A set of utility tools for the CompBioAsia Molecular
+# Dynamics tutorials.
+#
+# These Python functions provide an easy interface to
+# a range of third party tools that are useful for the
+# preparartion of molecular systems for MD simulation.
+# These include:
+#
+#   RDKit
+#   OpenBabel
+#   PDBFixer (a'spin-off' from OpenMM)
+#   Chimera/ChimeraX
+#   AmberTools
+#
+# The functions are:
+#
+#   smiles_to_pdb: Generates a PDB format file for a
+#                  molecule from a SMILES string. Tries
+#                  to be intelligent about protonation
+#                  states of any ionizable groups. Useful
+#                  for ligand preparation. Internally uses
+#                  RDKit and OpenBabel.
+#
+#  fix:            Remediates macromolecule structure files
+#                  obtained from the Protein Data Bank. Extracts
+#                  chosen chains, fills in missing residues and
+#                  atoms. (e.g. unresolved loops and side chains).
+#                  Useful for protein preparation. Internally uses
+#                  PDBFixer.
+#
+#  add_h:          Adds hydrogen atoms to heavy-atom only
+#                  PDB format files. This is hard to get
+#                  right every time with an automated tool,
+#                  but the version here uses Chimera (or
+#                  ChimeraX) which is often succesful. It
+#                  also uses tools from AmberTools to 'clean
+#                  up' the resulting structure, particularly
+#                  setting the names of HIS residues to HID,
+#                  HIE, or HIP depending on the predicted
+#                  tautomer/ionization state. Internally uses
+#                  Chimera(X) and pdb4amber.
+#
+#   parm:          A complete AMBER-focussed workflow to
+#                  prepare input files (coordinates and
+#                  parameters) for MD simulation, from
+#                  Complete PDB format files of the solute
+#                  components (e.g. all-atom models of
+#                  protein plus ligand). Includes automatic
+#                  parameterization of non-standard
+#                  residues (using gaff or gaff2), and addition
+#                  of water boxes and neutralizing counterions.
+#                  The tool only works for non-covalent ligands
+#                  (no bonds between the ligand and the protein).
+#                  Internally uses antechamber, parmchk2, and
+#                  tleap.
+#
+# Be aware that all these workflows can be confused by unusual
+# or in some way particularly awkward systems (e.g. bad initial
+# coordinates).
+#
+# SO PLEASE ALWAYS CHECK THE RESULTS CAREFULLY!
+#
+
 import mdtraj as mdt
 from pdbfixer import PDBFixer
 from openmm.app import PDBFile
@@ -11,6 +74,8 @@ from crossflow.filehandling import FileHandler
 from functools import cache
 import shutil
 
+from pathlib import Path
+
 
 def smiles_to_pdb(smi, pdb, pH=7.0):
     '''
@@ -18,13 +83,16 @@ def smiles_to_pdb(smi, pdb, pH=7.0):
 
     Args:
         smi (str): Input SMILES string
-        pdb (str): Name out output PDB file
+        pdb (str): Name of out output PDB file
         pH (float): target pH
+
+    Returns:
+        charge (int): Formal charge on the molecule.
 
     '''
     obc = ob.OBConversion()
     obc.SetInAndOutFormats('smi', 'smi')
- 
+
     obmol = ob.OBMol()
     obc.ReadString(obmol, smi)
     obmol.CorrectForPH(pH)
@@ -44,11 +112,12 @@ def fix(inpdb, outpdb, keep_chains=None, trim=True):
     Args:
         inpdb (str): input PDB file name
         outpdb (str): output PDB file name
-        keep_chains (None or list): chains to keep
+        keep_chains (None or list): chains to keep (None = all)
         trim (bool): if True, do not rebuild any missing N- and C-terminal
                      residues
 
     '''
+    _check_exists(inpdb)
 
     fixer = PDBFixer(filename=inpdb)
     if keep_chains:
@@ -91,13 +160,22 @@ def fix(inpdb, outpdb, keep_chains=None, trim=True):
     PDBFile.writeFile(fixer.topology, fixer.positions, open(outpdb, 'w'))
 
 
-def check_available(cmd):
+def _check_available(cmd):
     '''
     Little utility to check a required command is available
 
     '''
     if shutil.which(cmd) is None:
         raise RuntimeError(f'Error - cannot find the {cmd} command')
+
+
+def _check_exists(filename):
+    '''
+    Little utility to check if a required file is present
+
+    '''
+    if not Path(filename).exists():
+        raise RuntimeError(f'Error - cannot find required file {filename}')
 
 
 def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
@@ -111,8 +189,8 @@ def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
         mode (str): Adjust residue names for chosen software
                     (only 'amber' is currently supported).
     '''
-    #
-    check_available(chimera)
+    _check_exists(inpdb)
+    _check_available(chimera)
     chimera_version = SubprocessTask(f"{chimera} --version > version")
     chimera_version.set_outputs(["version"])
     version = chimera_version.run()
@@ -134,7 +212,7 @@ def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
     infile = fh.load(inpdb)
     outfile = addh.run(infile)
     if mode == 'amber':
-        check_available('pdb4amber')
+        _check_available('pdb4amber')
         pdb4amber = SubprocessTask('pdb4amber -i infile.pdb -o outfile.pdb')
         pdb4amber.set_inputs(['infile.pdb'])
         pdb4amber.set_outputs(['outfile.pdb'])
@@ -159,8 +237,13 @@ def param(inpdb, outprmtop, outinpcrd, het_names=None, het_charges=None,
         het_names (None or list): 3-letter residue names for heterogens
         het_charges (None or list): Formal charges of each heterogen
         forcefields (None or list): List of forcefields to use
+        solvate (None or str): Solvation option - can be 'box',
+                               'cube', or 'oct'.
+        buffer (float): minimum distance from any solute atom
+                        to a periodic box boundary (Angstroms)
 
     """
+    _check_exists(inpdb)
     if not forcefields:
         print('Warning: no forcefields specified, '
               'defaulting to "protein.ff14SB"')
@@ -216,6 +299,7 @@ def parameterize(source, residue_name, charge=0, gaff='gaff'):
     if gaff not in ('gaff', 'gaff2'):
         raise ValueError(f'Error: unrecognised gaff option "{gaff}": '
                          'must be "gaff" or "gaff2"')
+    _check_exists(source)
     traj = mdt.load(source)
     het_sel = traj.topology.select(f'resname {residue_name}')
     # A trajetory that contains all copies of the selected heterogen:
@@ -226,26 +310,26 @@ def parameterize(source, residue_name, charge=0, gaff='gaff'):
     traj_het.topology._bonds = []
     # Run antechamber
     traj_het.save(f'{residue_name}.pdb')
-    check_available('antechamber')
+    _check_available('antechamber')
     if gaff == 'gaff':
         antechamber = SubprocessTask('antechamber -i infile.pdb -fi pdb'
-                                       ' -o outfile.mol2 -fo mol2 -c bcc'
-                                       ' -nc {charge}')
+                                     ' -o outfile.mol2 -fo mol2 -c bcc'
+                                     ' -nc {charge}')
     else:
         antechamber = SubprocessTask('antechamber -i infile.pdb -fi pdb'
-                                       ' -o outfile.mol2 -fo mol2 -c bcc'
-                                       ' -nc {charge} -at gaff2')
+                                     ' -o outfile.mol2 -fo mol2 -c bcc'
+                                     ' -nc {charge} -at gaff2')
     antechamber.set_inputs(['infile.pdb', 'charge'])
     antechamber.set_outputs(['outfile.mol2'])
     outmol2 = antechamber.run(traj_het, charge)
     # run parmchk2
-    check_available('parmchk2')
+    _check_available('parmchk2')
     if gaff == 'gaff':
         parmchk = SubprocessTask('parmchk2 -i infile.mol2 -f mol2 -o'
-                                   ' outfile.frcmod')
+                                 ' outfile.frcmod')
     else:
         parmchk = SubprocessTask('parmchk2 -s 2 -i infile.mol2 -f mol2'
-                                   ' -o outfile.frcmod')
+                                 ' -o outfile.frcmod')
     parmchk.set_inputs(['infile.mol2'])
     parmchk.set_outputs(['outfile.frcmod'])
     frcmod = parmchk.run(outmol2)
@@ -275,6 +359,8 @@ def leap(amberpdb, ff, het_names=None, solvate=None, buffer=10.0):
     if het_names:
         if len(het_names) > 0:
             for r in het_names:
+                _check_exists(f'{r}.frcmod')
+                _check_exists(f'{r}.mol2')
                 script += f'loadamberparams {r}.frcmod\n'
                 script += f'{r} = loadmol2 {r}.mol2\n'
                 inputs += [f'{r}.mol2', f'{r}.frcmod']
