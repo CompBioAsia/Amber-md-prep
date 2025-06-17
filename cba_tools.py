@@ -55,6 +55,16 @@
 #                  Internally uses antechamber, parmchk2, and
 #                  tleap.
 #
+#   alpha_loopfix: A tool to fix missing residues in a PDB file
+#                  It uses ChimeraX to run AlphaFold and generates
+#                  a new PDB file with the missing residues filled in.
+#                  Note it does NOT complete non-loop residues, these
+#                  may still lack heavy and/or hydrogen atoms.
+#
+#   complete:      A tool to complete a PDB file by adding missing
+#                  atoms (heavy and hydrogen) using pdb4amber.
+#
+#
 # Be aware that all these workflows can be confused by unusual
 # or in some way particularly awkward systems (e.g. bad initial
 # coordinates).
@@ -63,6 +73,7 @@
 #
 
 import mdtraj as mdt
+import numpy as np
 from pdbfixer import PDBFixer
 from openmm.app import PDBFile
 
@@ -401,3 +412,149 @@ def leap(amberpdb, ff, het_names=None, solvate=None, buffer=10.0):
                 args += [f'{r}.mol2', f'{r}.frcmod']
     prmtop, inpcrd = tleap.run(*args)
     return prmtop, inpcrd
+
+
+def alpha_loopfix(inpdb, outpdb,
+                  max_shoulder_size=4,
+                  min_ca_displacement=0.1,
+                  chimerax='chimerax'):
+    '''
+    Fix missing residues in a PDB file using AlphaFold.
+    Args:
+        inpdb (str): input PDB file name
+        outpdb (str): output PDB file name
+        max_shoulder_size (int): maximum size of a loop shoulder
+                                 to be replaced by AlphaFold
+        min_ca_displacement (float): minimum displacement of the CA
+                                     atom from the original structure
+                                     to be replaced by AlphaFold
+        chimerax (str): command to invoke ChimeraX
+
+    '''
+    _check_exists(inpdb)
+    _check_available(chimerax)
+    t = mdt.load(inpdb)
+
+    bonds = [[b[0].index, b[1].index] for b in t.topology.bonds]
+    bls = mdt.compute_distances(t, bonds)[0]
+    bl_mean = bls.mean()
+    for i, bl in enumerate(bls):
+        if bl > bl_mean * 2:
+            ir = t.topology.atom(bonds[i][0]).residue.index
+            jr = t.topology.atom(bonds[i][1]).residue.index
+            if ir != jr:
+                t.topology._bonds.pop(i)
+    ms = t.topology.find_molecules()
+    if len(ms) == 1:
+        print('No gaps to fill.')
+        return
+    elif len(ms) == 2:
+        print('Structure contaons 1 gap.')
+    else:
+        print(f'Structure contains {len(ms)-1} gaps.')
+
+    fh = FileHandler()
+    script = fh.create('script')
+    script.write_text('open infile.pdb\nalphafold match #1\n'
+                      'save outfile.pdb #2\nquit')
+    find_af = SubprocessTask(f"{chimerax} --nogui < script")
+    find_af.set_inputs(['script', 'infile.pdb'])
+    find_af.set_outputs(['outfile.pdb', 'STDOUT'])
+    find_af.set_constant('script', script)
+
+    outfile, log = find_af(t)
+
+    for line in log.split('\n'):
+        if 'sequence similarity' in line:
+            print(line)
+        elif 'WARNING' in line:
+            print(line)
+
+    ta = mdt.load(outfile)
+
+    residues = []
+    for i in range(ta.topology.n_residues):
+        r = dict(alpha_res=ta.topology.residue(i), alpha_idx=i)
+        residues.append(r)
+
+    ref_seq = ta.topology.to_fasta()[0]
+    new_indx = []
+    d_from_gap = []
+    for im, m in enumerate(ms):
+        sel = [a.index for a in m]
+        frag = t.topology.subset(sel)
+        frag_seq = frag.to_fasta()[0]
+        start = ref_seq.index(frag_seq)
+        fl = len(frag_seq)
+        for i in range(fl):
+            new_indx.append(i + start)
+            if im == 0:
+                d_from_gap.append(fl - i)
+            elif im == len(ms) - 1:
+                d_from_gap.append(i+1)
+            else:
+                d_from_gap.append(min(i, fl-i))
+
+    pair_d = []
+    for i, j in enumerate(new_indx):
+        sel_i = t.topology.select(f'resid {i} and name CA')[0]
+        sel_j = ta.topology.select(f'resid {j} and name CA')[0]
+        dxyz = t.xyz[0, sel_i] - ta.xyz[0, sel_j]
+        pair_d.append(np.linalg.norm(dxyz))
+
+    for i, j in enumerate(new_indx):
+        residues[j]['xtal_idx'] = i
+        residues[j]['d_from_gap'] = d_from_gap[i]
+        residues[j]['xtal_res'] = t.topology.residue(i)
+        residues[j]['pair_d'] = pair_d[i]
+
+    if residues[0]['d_from_gap'] <= max_shoulder_size and \
+       residues[0]['pair_d'] > min_ca_displacement:
+        alist = [a.index for a in residues[0]['alpha_res'].atoms]
+        new_traj = ta.atom_slice(alist)
+    else:
+        alist = [a.index for a in residues[0]['xtal_res'].atoms]
+        new_traj = t.atom_slice(alist)
+    for r in residues[1:]:
+        if 'pair_d' not in r:
+            # Use the alphafold structure for this residue
+            alist = [a.index for a in r['alpha_res'].atoms]
+            new_traj = new_traj.stack(ta.atom_slice(alist))
+            print(f"Inserting missing residue {r['alpha_res']}.")
+        elif (r['d_from_gap'] <= max_shoulder_size and
+              r['pair_d'] > min_ca_displacement):
+            # Use the alphafold structure for this residue
+            alist = [a.index for a in r['alpha_res'].atoms]
+            new_traj = new_traj.stack(ta.atom_slice(alist))
+            print(f"Replacing {r['xtal_res']} with {r['alpha_res']}.")
+        else:
+            # Use the crystal structure for this residue
+            alist = [a.index for a in r['xtal_res'].atoms]
+            new_traj = new_traj.stack(t.atom_slice(alist))
+
+    new_top = mdt.Topology()
+    c = new_top.add_chain()
+    for r in new_traj.topology.residues:
+        nr = new_top.add_residue(r.name, c, r.resSeq)
+        for a in r.atoms:
+            new_top.add_atom(a.name, a.element, nr)
+    new_traj.topology = new_top
+    new_traj.save(outpdb)
+    print(f'Fixed structure saved as {outpdb}.')
+
+
+def complete(inpdb, outpdb):
+    '''
+    Complete a PDB file by adding missing atoms using pdb4amber.
+    Args:
+        inpdb (str): input PDB file name
+        outpdb (str): output PDB file name
+    '''
+    _check_exists(inpdb)
+    _check_available('pdb4amber')
+    pdb4amber = SubprocessTask('pdb4amber -i in.pdb --add-missing-atoms'
+                               ' --reduce > out.pdb')
+    pdb4amber.set_inputs(['in.pdb'])
+    pdb4amber.set_outputs(['out.pdb'])
+    out = pdb4amber(inpdb)
+    out.save(outpdb)
