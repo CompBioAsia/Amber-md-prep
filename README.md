@@ -3,7 +3,10 @@ Jupyter notebook based tutorial on protein-ligand preparation for AMBER simulati
 
 ## Instructions
 
-Clone this repo then execute `run_notebook.sh` to install required dependencies and launch the notebook.
+Clone this repo then:
+
+* if you are NOT using the CBA Jupyterhub, execute `run_notebook.sh` to install required dependencies and launch the notebook.
+* if you ARE using the CBA Jupyterhub, just open `protein_ligand_prep.ipynb`
 
 ## Author
 
