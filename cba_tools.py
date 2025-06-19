@@ -82,7 +82,7 @@ from rdkit.Chem import rdDistGeom
 from openbabel import openbabel as ob
 
 from crossflow.tasks import SubprocessTask
-from crossflow.filehandling import FileHandler
+from crossflow.filehandling import FileHandler, FileHandle
 from functools import cache
 import shutil
 
@@ -115,6 +115,42 @@ def smiles_to_pdb(smi, pdb, pH=7.0):
     rdDistGeom.EmbedMolecule(mol_pH_H)
     Chem.MolToPDBFile(mol_pH_H, pdb)
     return charge
+
+
+def alpha_match(prot_in, chimerax='chimerax'):
+    '''
+    Find an Alphafold structure that matches the supplied protein
+    structure file.
+
+    The input can be an MDTraj trajectory, a Crossflow FileHandle, a Path, or a
+    filename (string)
+    '''
+    _check_available(chimerax)
+
+    if not isinstance(prot_in, (str, Path, mdt.Trajectory, FileHandle)):
+        raise TypeError(f'Unsupported input type {type(prot_in)})')
+
+    if isinstance(prot_in, (str, Path)):
+        _check_exists(prot_in)
+
+    if not isinstance(prot_in, mdt.Trajectory):
+        # Convert to MDTraj trajectory
+        prot_in = mdt.load(prot_in)
+    if prot_in.topology.n_chains != 1:
+        raise ValueError('Input structure must contain exactly one chain')
+
+    fh = FileHandler()
+    script = fh.create('script')
+    script.write_text('open infile.pdb\nalphafold match #1\n'
+                      'save outfile.pdb #2\nquit')
+    find_af = SubprocessTask(f"{chimerax} --nogui < script")
+    find_af.set_inputs(['script', 'infile.pdb'])
+    find_af.set_outputs(['outfile.pdb', 'STDOUT'])
+    find_af.set_constant('script', script)
+
+    outfile, log = find_af(prot_in)
+
+    return outfile, log
 
 
 def fix(inpdb, outpdb, keep_chains=None, trim=True):
@@ -178,7 +214,7 @@ def _check_available(cmd):
 
     '''
     if shutil.which(cmd) is None:
-        raise RuntimeError(f'Error - cannot find the {cmd} command')
+        raise FileNotFoundError(f'Error: cannot find the {cmd} command')
 
 
 def _check_exists(filename):
@@ -187,7 +223,7 @@ def _check_exists(filename):
 
     '''
     if not Path(filename).exists():
-        raise RuntimeError(f'Error - cannot find required file {filename}')
+        raise FileNotFoundError(f'Error: cannot find required file {filename}')
 
 
 def add_h(inpdb, outpdb, chimera='chimera', mode='amber'):
@@ -323,7 +359,7 @@ def parameterize(source, residue_name, charge=0, gaff='gaff'):
         raise ValueError(f'Error: unrecognised gaff option "{gaff}": '
                          'must be "gaff" or "gaff2"')
     _check_exists(source)
-    traj = mdt.load(source)
+    traj = mdt.load_pdb(source, standard_names=False)
     het_sel = traj.topology.select(f'resname {residue_name}')
     # A trajetory that contains all copies of the selected heterogen:
     traj_hets = traj.atom_slice(het_sel)
@@ -414,6 +450,42 @@ def leap(amberpdb, ff, het_names=None, solvate=None, buffer=10.0):
     return prmtop, inpcrd
 
 
+def debogusbond(trajin):
+    '''
+    Remove bogus peptide bonds from a trajectory.
+
+    MDTraj will bond consecutive amino acids even if there is
+    a gap between them. This function removes such bonds.
+
+    Args:
+        trajin (mdt.Trajectory): input trajectory
+
+    Returns:
+        mdt.Trajectory: the cleaned trajectory
+
+    '''
+    if not isinstance(trajin, mdt.Trajectory):
+        raise TypeError('Input must be an MDTraj trajectory')
+
+    bonds = trajin.topology._bonds
+    ibonds = [[b[0].index, b[1].index] for b in bonds]
+    bls = mdt.compute_distances(trajin, ibonds)[0]
+
+    good_bonds = []
+    for i, bl in enumerate(bls):
+        bond_id = bonds[i][0].name + bonds[i][1].name
+        if bond_id == 'CN' or bond_id == 'NC':
+            # This is a peptide bond, check if it is bogus
+            if bl < 0.3:
+                # This is an OK bond, keep it
+                good_bonds.append(bonds[i])
+        else:
+            good_bonds.append(bonds[i])
+    trajout = mdt.Trajectory(trajin.xyz, trajin.topology)
+    trajout.topology._bonds = good_bonds
+    return trajout
+
+
 def alpha_loopfix(inpdb, outpdb,
                   max_shoulder_size=4,
                   min_ca_displacement=0.1,
@@ -433,36 +505,21 @@ def alpha_loopfix(inpdb, outpdb,
     '''
     _check_exists(inpdb)
     _check_available(chimerax)
-    t = mdt.load(inpdb)
 
-    bonds = [[b[0].index, b[1].index] for b in t.topology.bonds]
-    bls = mdt.compute_distances(t, bonds)[0]
-    bl_mean = bls.mean()
-    for i, bl in enumerate(bls):
-        if bl > bl_mean * 2:
-            ir = t.topology.atom(bonds[i][0]).residue.index
-            jr = t.topology.atom(bonds[i][1]).residue.index
-            if ir != jr:
-                t.topology._bonds.pop(i)
+    t = mdt.load_pdb(inpdb)
+
+    t = debogusbond(t)
+
     ms = t.topology.find_molecules()
     if len(ms) == 1:
         print('No gaps to fill.')
         return
     elif len(ms) == 2:
-        print('Structure contaons 1 gap.')
+        print('Structure contains 1 gap.')
     else:
         print(f'Structure contains {len(ms)-1} gaps.')
 
-    fh = FileHandler()
-    script = fh.create('script')
-    script.write_text('open infile.pdb\nalphafold match #1\n'
-                      'save outfile.pdb #2\nquit')
-    find_af = SubprocessTask(f"{chimerax} --nogui < script")
-    find_af.set_inputs(['script', 'infile.pdb'])
-    find_af.set_outputs(['outfile.pdb', 'STDOUT'])
-    find_af.set_constant('script', script)
-
-    outfile, log = find_af(t)
+    outfile, log = alpha_match(t, chimerax=chimerax)
 
     for line in log.split('\n'):
         if 'sequence similarity' in line:
@@ -470,7 +527,10 @@ def alpha_loopfix(inpdb, outpdb,
         elif 'WARNING' in line:
             print(line)
 
-    ta = mdt.load(outfile)
+    if not outfile:
+        raise RuntimeError(f'Error: AlphaFold search failed.\n{log}.')
+
+    ta = mdt.load_pdb(outfile)
 
     residues = []
     for i in range(ta.topology.n_residues):
@@ -560,6 +620,6 @@ def complete(inpdb, outpdb):
     # CONECT records added by pdb4amber end up bogus...
     if 'CONECT' in out.read_text():
         text = '\n'.join([line for line in out.read_text().split('\n')
-                         if not 'CONECT' in line]) + '\n'
+                         if 'CONECT' not in line]) + '\n'
         out.write_text(text)
     out.save(outpdb)
