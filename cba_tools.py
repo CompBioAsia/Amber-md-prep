@@ -557,4 +557,9 @@ def complete(inpdb, outpdb):
     pdb4amber.set_inputs(['in.pdb'])
     pdb4amber.set_outputs(['out.pdb'])
     out = pdb4amber(inpdb)
+    # CONECT records added by pdb4amber end up bogus...
+    if 'CONECT' in out.read_text():
+        text = '\n'.join([line for line in out.read_text().split('\n')
+                         if not 'CONECT' in line]) + '\n'
+        out.write_text(text)
     out.save(outpdb)
