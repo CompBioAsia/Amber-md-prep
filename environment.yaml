@@ -20,3 +20,4 @@ dependencies:
     - netCDF4
     - openbabel
     - pdbfixer
+    - mdtraj

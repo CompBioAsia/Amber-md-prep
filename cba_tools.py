@@ -41,7 +41,7 @@
 #                  tautomer/ionization state. Internally uses
 #                  Chimera(X) and pdb4amber.
 #
-#   parm:          A complete AMBER-focussed workflow to
+#   param:         A complete AMBER-focussed workflow to
 #                  prepare input files (coordinates and
 #                  parameters) for MD simulation, from
 #                  Complete PDB format files of the solute
@@ -109,7 +109,7 @@ def smiles_to_pdb(smi, pdb, pH=7.0):
     obc.ReadString(obmol, smi)
     obmol.CorrectForPH(pH)
     smi_pH = obc.WriteString(obmol)
-    charge = smi_pH.count('+') - smi_pH.count('-')
+    charge = smi_pH.count('+]') - smi_pH.count('-]')
     mol_pH = Chem.MolFromSmiles(smi_pH)
     mol_pH_H = Chem.AddHs(mol_pH)
     rdDistGeom.EmbedMolecule(mol_pH_H)
