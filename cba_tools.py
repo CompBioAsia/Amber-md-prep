@@ -8,7 +8,6 @@
 #
 #   RDKit
 #   OpenBabel
-#   PDBFixer (a'spin-off' from OpenMM)
 #   Chimera/ChimeraX
 #   AmberTools
 #   MDTraj
@@ -21,13 +20,6 @@
 #                  states of any ionizable groups. Useful
 #                  for ligand preparation. Internally uses
 #                  RDKit and OpenBabel.
-#
-#  fix:            Remediates macromolecule structure files
-#                  obtained from the Protein Data Bank. Extracts
-#                  chosen chains, fills in missing residues and
-#                  atoms. (e.g. unresolved loops and side chains).
-#                  Useful for protein preparation. Internally uses
-#                  PDBFixer.
 #
 #  add_h:          Adds hydrogen atoms to heavy-atom only
 #                  PDB format files. This is hard to get
@@ -74,8 +66,6 @@
 
 import mdtraj as mdt
 import numpy as np
-from pdbfixer import PDBFixer
-from openmm.app import PDBFile
 
 from rdkit import Chem
 from rdkit.Chem import rdDistGeom
@@ -84,9 +74,16 @@ from openbabel import openbabel as ob
 from crossflow.tasks import SubprocessTask
 from crossflow.filehandling import FileHandler, FileHandle
 from functools import cache
+from enum import IntEnum
 import shutil
 
+import requests
+from requests import exceptions
+# from conditional_cache import lru_cache
+from tempfile import NamedTemporaryFile
+# from retry_requests import retry
 from pathlib import Path
+from time import sleep
 
 
 def smiles_to_pdb(smi, pdb, pH=7.0):
@@ -117,95 +114,395 @@ def smiles_to_pdb(smi, pdb, pH=7.0):
     return charge
 
 
-def alpha_match(prot_in, chimerax='chimerax'):
-    '''
-    Find an Alphafold structure that matches the supplied protein
-    structure file.
-
-    The input can be an MDTraj trajectory, a Crossflow FileHandle, a Path, or a
-    filename (string)
-    '''
-    _check_available(chimerax)
-
-    if not isinstance(prot_in, (str, Path, mdt.Trajectory, FileHandle)):
-        raise TypeError(f'Unsupported input type {type(prot_in)})')
-
-    if isinstance(prot_in, (str, Path)):
-        _check_exists(prot_in)
-
-    if not isinstance(prot_in, mdt.Trajectory):
-        # Convert to MDTraj trajectory
-        prot_in = mdt.load(prot_in)
-    if prot_in.topology.n_chains != 1:
-        raise ValueError('Input structure must contain exactly one chain')
-
-    fh = FileHandler()
-    script = fh.create('script')
-    script.write_text('open infile.pdb\nalphafold match #1\n'
-                      'save outfile.pdb #2\nquit')
-    find_af = SubprocessTask(f"{chimerax} --nogui < script")
-    find_af.set_inputs(['script', 'infile.pdb'])
-    find_af.set_outputs(['outfile.pdb', 'STDOUT'])
-    find_af.set_constant('script', script)
-
-    outfile, log = find_af(prot_in)
-
-    return outfile, log
+# For the Smith-Waterman code:
+class Score(IntEnum):
+    MATCH = 1
+    MISMATCH = -1
+    GAP = -1
 
 
-def fix(inpdb, outpdb, keep_chains=None, trim=True):
-    '''
-    Remediate a PDB file using pdbfixer.
+# Assigning the constant values for the traceback
+class Trace(IntEnum):
+    STOP = 0
+    LEFT = 1
+    UP = 2
+    DIAGONAL = 3
+
+
+def smith_waterman(seq1, seq2):
+    '''A simple Smith-Waterman local alignment routine.
+
+    Adapted from:
+    https://github.com/slavianap/Smith-Waterman-Algorithm/blob/master/Script.py
 
     Args:
-        inpdb (str): input PDB file name
-        outpdb (str): output PDB file name
-        keep_chains (None or list): chains to keep (None = all)
-        trim (bool): if True, do not rebuild any missing N- and C-terminal
-                     residues
+       seq1 (str): The first sequence
+       seq2 (str): The second sequence
 
     '''
-    _check_exists(inpdb)
+    # Generating the empty matrices for storing scores and tracing
+    row = len(seq1) + 1
+    col = len(seq2) + 1
+    matrix = np.zeros(shape=(row, col), dtype=int)
+    tracing_matrix = np.zeros(shape=(row, col), dtype=int)
 
-    fixer = PDBFixer(filename=inpdb)
-    if keep_chains:
-        chains = list(fixer.topology.chains())
-        removals = []
-        for i, chain in enumerate(chains):
-            if chain.id not in keep_chains:
-                removals.append(i)
+    # Initialising the variables to find the highest scoring cell
+    max_score = -1
+    max_index = (-1, -1)
 
-        print(f'Removing {len(removals)} unwanted chains')
-        fixer.removeChains(removals)
-    fixer.findMissingResidues()
-    chains = list(fixer.topology.chains())
-    keys = fixer.missingResidues.keys()
-    # keys are tuples (chain_index, residue_index)
-    ignored_keys = []
-    for key in keys:
-        chain = chains[key[0]]
-        if trim and (key[1] == 0 or key[1] == len(list(chain.residues()))):
-            if key[1] == 0:
-                print('Missing N-terminal residues (will be ignored):')
-            else:
-                print('Missing C-terminal residues (will be ignored):')
-            print(' ', ', '.join(fixer.missingResidues[key]))
-            ignored_keys.append(key)
+    # Calculating the scores for all cells in the matrix
+    for i in range(1, row):
+        for j in range(1, col):
+            # Calculating the diagonal score (match score)
+            match_value = Score.MATCH if seq1[i - 1] == seq2[j - 1] \
+                            else Score.MISMATCH
+            diagonal_score = matrix[i - 1, j - 1] + match_value
+
+            # Calculating the vertical gap score
+            vertical_score = matrix[i - 1, j] + Score.GAP
+
+            # Calculating the horizontal gap score
+            horizontal_score = matrix[i, j - 1] + Score.GAP
+
+            # Taking the highest score
+            matrix[i, j] = max(0, diagonal_score, vertical_score,
+                               horizontal_score)
+
+            # Tracking where the cell's value is coming from
+            if matrix[i, j] == 0:
+                tracing_matrix[i, j] = Trace.STOP
+
+            elif matrix[i, j] == horizontal_score:
+                tracing_matrix[i, j] = Trace.LEFT
+
+            elif matrix[i, j] == vertical_score:
+                tracing_matrix[i, j] = Trace.UP
+
+            elif matrix[i, j] == diagonal_score:
+                tracing_matrix[i, j] = Trace.DIAGONAL
+
+            # Tracking the cell with the maximum score
+            if matrix[i, j] >= max_score:
+                max_index = (i, j)
+                max_score = matrix[i, j]
+
+    # Initialising the variables for tracing
+    aligned_seq1 = ""
+    aligned_seq2 = ""
+    current_aligned_seq1 = ""
+    current_aligned_seq2 = ""
+    (max_i, max_j) = max_index
+
+    # Tracing and computing the pathway with the local alignment
+    while tracing_matrix[max_i, max_j] != Trace.STOP:
+        if tracing_matrix[max_i, max_j] == Trace.DIAGONAL:
+            current_aligned_seq1 = seq1[max_i - 1]
+            current_aligned_seq2 = seq2[max_j - 1]
+            max_i = max_i - 1
+            max_j = max_j - 1
+
+        elif tracing_matrix[max_i, max_j] == Trace.UP:
+            current_aligned_seq1 = seq1[max_i - 1]
+            current_aligned_seq2 = '-'
+            max_i = max_i - 1
+
+        elif tracing_matrix[max_i, max_j] == Trace.LEFT:
+            current_aligned_seq1 = '-'
+            current_aligned_seq2 = seq2[max_j - 1]
+            max_j = max_j - 1
+
+        aligned_seq1 = aligned_seq1 + current_aligned_seq1
+        aligned_seq2 = aligned_seq2 + current_aligned_seq2
+
+    # Reversing the order of the sequences
+    aligned_seq1 = aligned_seq1[::-1]
+    aligned_seq2 = aligned_seq2[::-1]
+
+    #  Add unmatched ends, if any:
+    if max_i > 0:
+        aligned_seq1 = seq1[:max_i] + aligned_seq1
+        aligned_seq2 = '-' * max_i + aligned_seq2
+    elif max_j > 0:
+        aligned_seq2 = seq2[:max_j] + aligned_seq2
+        aligned_seq1 = '-' * max_j + aligned_seq1
+
+    if max_index[0] < row - 1:
+        aligned_seq1 += seq1[max_index[0]:]
+        aligned_seq2 += '-' * (row - 1 - max_index[0])
+    elif max_index[1] < col - 1:
+        aligned_seq2 += seq2[max_index[1]:]
+        aligned_seq1 += '-' * (col - 1 - max_index[1])
+    return aligned_seq1, aligned_seq2
+
+
+def aln_score(alignment):
+    ''' Calculate the number of matches and gaps in a pairwise alignment.'''
+    if not len(alignment[0]) == len(alignment[1]):
+        raise ValueError('Error: alignments must be the same length')
+    matches = 0
+    gaps = 0
+    for a, b in zip(*alignment):
+        if '-' in a+b:
+            gaps += 1
         else:
-            print('Missing at position ', key[1], '(will be fixed):')
-            print(' ', ', '.join(fixer.missingResidues[key]))
-    for key in ignored_keys:
-        del fixer.missingResidues[key]
+            matches += 1
+    return matches, gaps
 
-    fixer.findMissingAtoms()
-    print('Missing heavy atoms:')
-    for r in fixer.missingAtoms:
-        print(' ', r.name, r.index, ':', ', '.join([a.name for a in
-                                                   fixer.missingAtoms[r]]))
 
-    fixer.addMissingAtoms()
-    print(f'Remediated structure written to {outpdb}')
-    PDBFile.writeFile(fixer.topology, fixer.positions, open(outpdb, 'w'))
+def match_align(t1, t2, cutoff=0.02):
+    '''
+    Superimpose t1 onto t2, based on sequence alignment
+
+    The C-alpha atoms used for least-squares fitting are iteratively pruned
+    until all pairs are within cutoff nanometers.
+
+    '''
+    alignment = smith_waterman(t1.topology.to_fasta()[0],
+                               t2.topology.to_fasta()[0])
+    i = -1
+    j = -1
+    pairs = []
+    ca1 = t1.topology.select('name CA')
+    ca2 = t2.topology.select('name CA')
+    for a, b in zip(*alignment):
+        if a != '-':
+            i += 1
+        if b != '-':
+            j += 1
+        if '-' not in a+b:
+            pairs.append((ca1[i], ca2[j]))
+    unconverged = True
+    while unconverged:
+        atom_indices = [p[0] for p in pairs]
+        ref_atom_indices = [p[1] for p in pairs]
+        t1_matched = t1.superpose(t2, atom_indices=atom_indices,
+                                  ref_atom_indices=ref_atom_indices)
+        dx = t1_matched.xyz[0, atom_indices] - t2.xyz[0, ref_atom_indices]
+        err = np.linalg.norm(dx, axis=1)
+        if err.max() > cutoff:
+            ierr = np.argsort(err)
+            icut = np.argmax(err[ierr] > cutoff)
+            lerr = len(err)
+            r1 = (lerr-icut) // 2
+            r2 = lerr // 10
+            r = min(r1, r2)
+            r = max(r, 1)
+            discards = ierr[-r:]
+            old_pairs = pairs
+            pairs = []
+            for i, p in enumerate(old_pairs):
+                if i not in discards:
+                    pairs.append(p)
+        else:
+            unconverged = False
+
+    return t1_matched, alignment
+
+
+def _append(traj1, traj2, i):
+    '''
+    Append residue i from traj2 to traj1
+    '''
+    if traj1 is None:
+        traj1 = traj2.atom_slice(
+            traj2.topology.select(f'resid {i}'))
+    else:
+        traj1 = traj1.stack(traj2.atom_slice(
+            traj2.topology.select(f'resid {i}')))
+    return traj1
+
+
+def merge(acceptor, donor, alignment, shoulder_width=3, trim=True):
+    '''
+    Merge two MDTraj trajectories based on a sequence alignment.
+
+    Missing parts of the acceptor trajectory are filled in with
+    parts from the donor trajectory.
+
+    It is assumed that the two trajectories are already structurally
+    aligned.
+
+    '''
+    matches, gaps = aln_score(alignment)
+    if gaps == 0:
+        print('Warning: no gaps detected')
+        return acceptor
+    aln2, aln1 = alignment
+
+    nr = len(aln1)
+    gappy = [a for a in aln1]
+    if trim:
+        i = 0
+        while gappy[i] == '-':
+            gappy[i] = 'x'
+            i += 1
+        i = len(gappy) - 1
+        while gappy[i] == '-':
+            gappy[i] = 'x'
+            i -= 1
+
+    for w in range(1, shoulder_width+1):
+        for i in range(w, nr-w):
+            if gappy[i-w] == '-' or gappy[i+w] == '-':
+                gappy[i] = '?'
+    # gappy holds info about shoulder residues and any trimming to be done.
+    gappy = ''.join(gappy)
+    traj = None
+    j1 = 0
+    j2 = 0
+    for i, r in enumerate(aln1):
+        if r == '-':  # use t2
+            if gappy[i] != 'x':
+                print(f'adding {donor.topology.residue(j2)}')
+                traj = _append(traj, donor, j2)
+            j2 += 1
+        else:
+            if gappy[i] == '?':
+                # shoulder residue, use t2
+                print(f'substituting {donor.topology.residue(j2)}')
+                traj = _append(traj, donor, j2)
+                j2 += 1
+                j1 += 1
+            else:
+                traj = _append(traj, acceptor, j1)
+                j1 += 1
+                if aln2[i] != '-':
+                    j2 += 1
+    newtop = mdt.Topology()
+    cid = newtop.add_chain()
+    for r in traj.topology.residues:
+        rid = newtop.add_residue(r.name, cid)
+        for a in r.atoms:
+            _ = newtop.add_atom(a.name, a.element, rid)
+    newtop._bonds = traj.topology._bonds
+    return mdt.Trajectory(traj.xyz, newtop)
+
+
+def loopfix(acceptor, donor, cutoff=0.02):
+    '''
+    remediate acceptor using residues from donor
+    '''
+    donor_at_acceptor, alignment = match_align(donor, acceptor, cutoff=cutoff)
+    fixed_acceptor = merge(acceptor, donor_at_acceptor, alignment)
+    return fixed_acceptor
+
+
+class Blaster():
+    def __init__(self, session=None):
+        if not session:
+            #  self.session = retry(requests.Session(), retries=5,
+            #                      backoff_factor=0.2)
+            self.session = requests.Session()
+        else:
+            self.session = session
+        self.url_base = 'https://blast.ncbi.nlm.nih.gov/Blast.cgi'
+
+    def submit(self, fasta):
+        '''
+        Submit a Blast job to find the Uniprot IDs
+        of the best matches to a sequence
+
+        '''
+        params = {
+            'CMD': 'Put',
+            'QUERY': fasta,
+            'DATABASE': 'swissprot',
+            'PROGRAM': 'blastp',
+            'HITLIST_SIZE': 3,
+            'ALIGNMENTS': 3
+        }
+        try:
+            response = self.session.get(self.url_base, params=params)
+        except exceptions.ConnectionError:
+            raise exceptions.ConnectionError("Error: can't reach Blast server")
+
+        content = response.text.split('\n')
+
+        for c in content:
+            if 'RID =' in c:
+                rid = c.split()[2]
+
+        content = response.text.split('\n')
+        for c in content:
+            if 'estimate' in c:
+                delay = int(c.split()[8])
+        return rid, delay
+
+    def status(self, rid):
+        '''
+        Check the status of a job
+
+        '''
+        response = self.session.get(self.url_base,
+                                    params={'CMD': 'Get', 'RID': rid})
+        if 'Status=' in response.text:
+            ioff = response.text.index('Status=')
+            text = response.text[ioff+7:ioff+17].split()[0]
+            return text
+        else:
+            return 'UNKNOWN'
+
+    def retrieve(self, rid):
+        '''
+        Retrieve the results of a job
+
+        '''
+        response = self.session.get(self.url_base,
+                                    params={'CMD': 'Get',
+                                            'RID': rid,
+                                            'FORMAT_TYPE': 'JSONSA'})
+
+        data = response.json()
+        alignments = data['Seq_annot']['data']['align']
+        accessions = []
+        for alignment in alignments:
+            accessions.append(alignment['segs']['denseg']['ids'][1][
+                'swissprot']['accession'])
+        return accessions
+
+
+#  @lru_cache(condition=lambda result: result is not None)
+def search_accession(fasta, session=None):
+    '''
+    See if you can find a Uniprot accession Id for the sequence in traj
+    '''
+    blaster = Blaster(session=session)
+    rid, delay = blaster.submit(fasta)
+    waiting = True
+    while waiting:
+        print('waiting...')
+        sleep(delay)
+        status = blaster.status(rid)
+        waiting = status == 'WAITING'
+
+    try:
+        accessions = blaster.retrieve(rid)
+    except Exception as e:
+        print(type(e))
+        return
+    return accessions
+
+
+def alpha_get(uniprot_id, session=None):
+    '''
+    Get the Alphafold structure with the given Uniprot Id
+    If it exists
+    '''
+    if not session:
+        #  session = retry(requests.Session(), retries=5, backoff_factor=0.2)
+        session = requests.Session()
+    base_url = f'https://alphafold.com/api/prediction/{uniprot_id}'
+    response = session.get(base_url)
+    data = response.json()
+    if 'error' in data:
+        raise ValueError(f'Error: {uniprot_id} not in Alphafold database')
+
+    pdb_url = data[0]['pdbUrl']
+    response2 = session.get(pdb_url)
+    with NamedTemporaryFile(suffix='.pdb') as f:
+        f.write(response2.text.encode('utf-8'))
+        t = mdt.load_pdb(f.name)
+    return t
 
 
 def _check_available(cmd):
@@ -450,7 +747,29 @@ def leap(amberpdb, ff, het_names=None, solvate=None, buffer=10.0):
     return prmtop, inpcrd
 
 
-def debogusbond(trajin):
+def complete(inpdb, outpdb):
+    '''
+    Complete a PDB file by adding missing atoms using pdb4amber.
+    Args:
+        inpdb (str): input PDB file name
+        outpdb (str): output PDB file name
+    '''
+    _check_exists(inpdb)
+    _check_available('pdb4amber')
+    pdb4amber = SubprocessTask('pdb4amber -i in.pdb --add-missing-atoms'
+                               ' --reduce > out.pdb')
+    pdb4amber.set_inputs(['in.pdb'])
+    pdb4amber.set_outputs(['out.pdb'])
+    out = pdb4amber(inpdb)
+    # CONECT records added by pdb4amber end up bogus...
+    if 'CONECT' in out.read_text():
+        text = '\n'.join([line for line in out.read_text().split('\n')
+                         if 'CONECT' not in line]) + '\n'
+        out.write_text(text)
+    out.save(outpdb)
+
+
+def gapsplit(trajin):
     '''
     Remove bogus peptide bonds from a trajectory.
 
@@ -486,11 +805,52 @@ def debogusbond(trajin):
     return trajout
 
 
+def alpha_match(prot_in, chimerax='chimerax', trim=True):
+    '''
+    Find an Alphafold structure that matches the supplied protein
+    structure file.
+
+    The input can be an MDTraj trajectory, a Crossflow FileHandle, a Path, or a
+    filename (string)
+    '''
+    _check_available(chimerax)
+
+    if not isinstance(prot_in, (str, Path, mdt.Trajectory, FileHandle)):
+        raise TypeError(f'Unsupported input type {type(prot_in)})')
+
+    if isinstance(prot_in, (str, Path)):
+        _check_exists(prot_in)
+
+    if not isinstance(prot_in, mdt.Trajectory):
+        # Convert to MDTraj trajectory
+        prot_in = mdt.load(prot_in)
+    if prot_in.topology.n_chains != 1:
+        raise ValueError('Input structure must contain exactly one chain')
+
+    fh = FileHandler()
+    script = fh.create('script')
+    if trim:
+        script.write_text('open infile.pdb\nalphafold match #1\n'
+                          'save outfile.pdb #2\nquit')
+    else:
+        script.write_text('open infile.pdb\nalphafold match #1 trim false\n'
+                          'save outfile.pdb #2\nquit')
+    find_af = SubprocessTask(f"{chimerax} --nogui < script")
+    find_af.set_inputs(['script', 'infile.pdb'])
+    find_af.set_outputs(['outfile.pdb', 'STDOUT'])
+    find_af.set_constant('script', script)
+
+    outfile, log = find_af(prot_in)
+
+    return outfile, log
+
+
 def alpha_loopfix(inpdb, outpdb,
                   max_shoulder_size=4,
                   min_ca_displacement=0.1,
-                  chimerax='chimerax'):
-    '''
+                  chimerax='chimerax',
+                  trim=True):
+    """
     Fix missing residues in a PDB file using AlphaFold.
     Args:
         inpdb (str): input PDB file name
@@ -501,25 +861,31 @@ def alpha_loopfix(inpdb, outpdb,
                                      atom from the original structure
                                      to be replaced by AlphaFold
         chimerax (str): command to invoke ChimeraX
+        trim (bool): whether to trim the AlphaFold
+                      structure to match the input structure
 
-    '''
+    """
     _check_exists(inpdb)
     _check_available(chimerax)
+    if not trim:
+        print('Warning: trim=False, the output structure will contain'
+              ' all residues from the AlphaFold structure.')
 
     t = mdt.load_pdb(inpdb)
 
-    t = debogusbond(t)
+    t = gapsplit(t)
 
     ms = t.topology.find_molecules()
     if len(ms) == 1:
         print('No gaps to fill.')
-        return
+        if trim:
+            return
     elif len(ms) == 2:
         print('Structure contains 1 gap.')
     else:
         print(f'Structure contains {len(ms)-1} gaps.')
 
-    outfile, log = alpha_match(t, chimerax=chimerax)
+    outfile, log = alpha_match(t, chimerax=chimerax, trim=trim)
 
     for line in log.split('\n'):
         if 'sequence similarity' in line:
@@ -568,8 +934,13 @@ def alpha_loopfix(inpdb, outpdb,
         residues[j]['xtal_res'] = t.topology.residue(i)
         residues[j]['pair_d'] = pair_d[i]
 
-    if residues[0]['d_from_gap'] <= max_shoulder_size and \
-       residues[0]['pair_d'] > min_ca_displacement:
+    if 'pair_d' not in residues[0]:
+        # Gap (extra N-termnal residues) at the start, use the first residue f
+        # rom the alphafold structure
+        alist = [a.index for a in residues[0]['alpha_res'].atoms]
+        new_traj = ta.atom_slice(alist)
+    elif residues[0]['d_from_gap'] <= max_shoulder_size and \
+      residues[0]['pair_d'] > min_ca_displacement:
         alist = [a.index for a in residues[0]['alpha_res'].atoms]
         new_traj = ta.atom_slice(alist)
     else:
@@ -601,25 +972,3 @@ def alpha_loopfix(inpdb, outpdb,
     new_traj.topology = new_top
     new_traj.save(outpdb)
     print(f'Fixed structure saved as {outpdb}.')
-
-
-def complete(inpdb, outpdb):
-    '''
-    Complete a PDB file by adding missing atoms using pdb4amber.
-    Args:
-        inpdb (str): input PDB file name
-        outpdb (str): output PDB file name
-    '''
-    _check_exists(inpdb)
-    _check_available('pdb4amber')
-    pdb4amber = SubprocessTask('pdb4amber -i in.pdb --add-missing-atoms'
-                               ' --reduce > out.pdb')
-    pdb4amber.set_inputs(['in.pdb'])
-    pdb4amber.set_outputs(['out.pdb'])
-    out = pdb4amber(inpdb)
-    # CONECT records added by pdb4amber end up bogus...
-    if 'CONECT' in out.read_text():
-        text = '\n'.join([line for line in out.read_text().split('\n')
-                         if 'CONECT' not in line]) + '\n'
-        out.write_text(text)
-    out.save(outpdb)
