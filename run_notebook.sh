@@ -55,7 +55,7 @@ cd "$(dirname "$0")"
 # Choose a name for the new environment
 # Note that deleting this will not clean up the micromamba cache, which may be
 # substantial.
-ENVNAME='cba_md_25'
+ENVNAME='cba_md_26'
 
 # The filename of the Conda environment file to run the notebook in
 ENV_FILE='environment.yaml'
@@ -113,4 +113,4 @@ micromamba activate "$ENVNAME"
 # Install pypi-only packages:
 pip install crossflow
 # Open the notebook in the new environment
-jupyter lab $NOTEBOOK
+# jupyter lab $NOTEBOOK
