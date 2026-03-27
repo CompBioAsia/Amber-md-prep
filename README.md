@@ -1,11 +1,11 @@
 # Amber-md-prep
-Jupyter notebook based tutorial on protein-ligand preparation for AMBER simulation prepared for CompBioAsia 2025
+Jupyter notebook based tutorial on protein-ligand preparation for AMBER simulation prepared for CompBioAsia 2026
 
 ## Instructions
 
 Clone this repo then:
 
-* if you are NOT using the CBA Jupyterhub, execute `run_notebook.sh` to install required dependencies and launch the notebook. In addition you need to have [ChimeraX](https://www.cgl.ucsf.edu/chimerax/) installed and able to be launched from the command line.
+* if you are NOT using the CBA Jupyterhub, execute `run_notebook.sh` to install required dependencies and launch the notebook.
 * if you ARE using the CBA Jupyterhub than all requirements have already been installed for you, just open `protein_ligand_prep.ipynb`
 
 ## Author
