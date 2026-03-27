@@ -110,7 +110,7 @@ unset PYTHONHOME
 
 # Activate the new environment
 micromamba activate "$ENVNAME"
-# Install pypi-only packages:
+# Install pip-only packages:
 pip install crossflow
 pip install git+https://github.com/CharlieLaughton/Alphafix.git
 pip install git+https://github.com/CompBioAsia/CBAtools.git
