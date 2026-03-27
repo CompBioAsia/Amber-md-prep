@@ -112,5 +112,8 @@ unset PYTHONHOME
 micromamba activate "$ENVNAME"
 # Install pypi-only packages:
 pip install crossflow
+pip install git+https://github.com/CharlieLaughton/Alphafix.git
+pip install git+https://github.com/CompBioAsia/CBAtools.git
 # Open the notebook in the new environment
-# jupyter lab $NOTEBOOK
+jupyter lab workspaces import ${ENVNAME}.jupyterlab-workspace
+jupyter lab $NOTEBOOK
