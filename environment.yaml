@@ -16,6 +16,7 @@ dependencies:
     - parmed
     - nglview>=3.0.6,<3.1.0
     - netCDF4
-    - mdtraj
+    - numpy==2.2.6
+    - mdtraj==1.11.1.post1
     - openmm
     - ambertools
