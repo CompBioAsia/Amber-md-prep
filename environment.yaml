@@ -17,6 +17,6 @@ dependencies:
     - nglview>=3.0.6,<3.1.0
     - netCDF4
     - numpy==2.2.6
-    - mdtraj==1.11.1.post1
+    - mdtraj
     - openmm
     - ambertools
